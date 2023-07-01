@@ -1,13 +1,16 @@
 #include <Wire.h>
 #include <ros.h>
+#include <dkrobot_msgs/EncodersStamped.h>
 #include <std_msgs/String.h>
 #include <std_msgs/Float32.h>
 #include <geometry_msgs/Vector3Stamped.h>
 #include <geometry_msgs/Twist.h>
 #include <geometry_msgs/Pose2D.h>
+#include <sensor_msgs/JointState.h>
 #include <ros/time.h>
+#include <tf/tf.h>
+#include <tf/transform_broadcaster.h>
 #include <ArduinoHardware.h>
-
 
 //initializing all the variables
 #define LOOPTIME          100                 //Thời gian lấy mẫu
@@ -28,13 +31,13 @@ const int PIN_R_ENCOD_A_MOTOR = 3;              //A channel for encoder of right
 const int PIN_R_ENCOD_B_MOTOR = 17;              //B channel for encoder of right motor
 const int Standby = 27;
 unsigned long long lastMilli = 0;
-const double radius = 0.0287;               // Bán kính bánh xe truyền động, m
+const double radius = 0.028765;               // Bán kính bánh xe truyền động, m
 const double wheelbase = 0.206;               //Khoảng cách giữa 2 bánh xe, m
 
 double speed_req = 0;                         //Vận tốc dài mong muốn từ ROS gửi xuống, m/s
 double angular_speed_req = 0;                 //Vận tốc góc mong muốn từ ROS gửi xuống, rad/s
 
-double kpL = 150, kiL = 250, kdL = 0.1;
+double kpL = 1000, kiL = 2500, kdL = 0.1;
 double speed_req_left = 0;                    //Vận tốc bánh trái mong muốn, m/s
 double speed_act_left = 0;                    //Vận tốc bánh trái thực tế, m/s
 double left_error = 0;
@@ -43,9 +46,10 @@ double left_llastError = 0;
 double PWM_leftMotor_last = 0; 
 double PWM_leftMotor = 0;                         //Xung PWM cấp cho  động cơ trái
 double aL = 0,bL = 0,gL = 0;
+float position_left = 0;
 volatile double pos_left = 0;       //biến đếm xung encoder động cơ trái
 
-double kpR = 200, kiR = 275, kdR = 0.1;
+double kpR = 900, kiR = 2300, kdR = 0.0;
 double speed_req_right = 0;                   //Desired speed for right wheel in m/s
 double speed_act_right = 0;                   //Actual speed for right wheel in m/s
 double right_error = 0;
@@ -54,6 +58,7 @@ double right_llastError = 0;
 double PWM_rightMotor_last = 0; 
 double PWM_rightMotor = 0;                       //Xung PWM cấp cho  động cơ phải
 double aR = 0,bR = 0,gR = 0;
+float position_right = 0;
 volatile double pos_right = 0;      //biến đếm xung encoder động cơ phải
 
 const double max_speed = 0.25;                 //Vận tốc giới hạn, m/s
@@ -68,16 +73,27 @@ void handle_cmd (const geometry_msgs::Twist& cmd_vel) {
   speed_req = cmd_vel.linear.x;                                     //Extract the commanded linear speed from the message
   angular_speed_req = cmd_vel.angular.z;                            //Extract the commanded angular speed from the message
   speed_req_left  = speed_req - angular_speed_req * (wheelbase / 2); //Calculate the required speed for the left motor to comply with commanded linear and angular speeds 
-  speed_req_right = speed_req + angular_speed_req * (wheelbase / 2); //Calculate the required speed for the right motor to comply with commanded linear and angular speeds  
+  speed_req_right = speed_req + angular_speed_req * (wheelbase / 2); //Calculate the required speed for the right motor to comply with commanded linear and angular speeds 
+  if (abs(speed_req_left) > 0.3) speed_req_left = 0.3;
+  if (abs(speed_req_right) > 0.3) speed_req_right = 0.3;
 } 
 geometry_msgs::Pose2D pwm_output_msg; 
 geometry_msgs::Pose2D encoder_msg; 
 geometry_msgs::Vector3Stamped speed_msg;                                //create a "speed_msg" ROS message
+sensor_msgs::JointState joint_state_msg;
+
+geometry_msgs::TransformStamped t;
+tf::TransformBroadcaster broadcaster;
+char base_link[] = "/base_footprint";
+char odom[] = "/odom";
 
 ros::Subscriber<geometry_msgs::Twist> cmd_vel("cmd_vel", &handle_cmd);   //create a subscriber to ROS topic for velocity commands (will execute "handle_cmd" function when receiving data)
 ros::Publisher speed_pub("speed", &speed_msg);                          //create a publisher to ROS topic "speed" using the "speed_msg" type
 ros::Publisher pwm_output_pub("pwm_output", &pwm_output_msg);
 ros::Publisher encoder_pub("encoder", &encoder_msg);
+ros::Publisher joint_state_pub("measured_joint_states", &joint_state_msg);
+
+
 
 void setup() {
   nh.initNode();//init ROS node
@@ -86,6 +102,13 @@ void setup() {
   nh.advertise(speed_pub);                  //prepare to publish speed in ROS topic
   nh.advertise(encoder_pub);
   nh.advertise(pwm_output_pub);
+  broadcaster.init(nh);
+
+  joint_state_msg.position = (float*)malloc(sizeof(float) * 2);
+  joint_state_msg.position_length = 2;
+  joint_state_msg.velocity = (float*)malloc(sizeof(float) * 2);
+  joint_state_msg.velocity_length = 2;
+  nh.advertise(joint_state_pub);
 
   //setting motor speeds to zero
   pinMode(Standby, OUTPUT);
@@ -106,7 +129,6 @@ void setup() {
   pinMode(PIN_R_ENCOD_B_MOTOR, INPUT);
   attachInterrupt(digitalPinToInterrupt(PIN_R_ENCOD_A_MOTOR), encoderRightMotor, RISING);
   digitalWrite(Standby,HIGH);
-  
 }
 void loop() {
   nh.spinOnce();
@@ -114,16 +136,20 @@ void loop() {
     lastMilli = millis();
     if (abs(pos_left) < 5) {
       speed_act_left = 0;
+      position_left = 0;
     }
     else {
       speed_act_left = ((pos_left/1441)*2 * PI) *(1000/LOOPTIME)*radius;//rpm !!!! 11*131 = 1441 encoder total pulse coun
+      position_left = ((pos_left/1441)*2 * PI)*radius;
     }
       
     if (abs(pos_right) < 5) {
       speed_act_right = 0;                                                 //Avoid taking in account small disturbances
+      position_right = 0;
     }
     else {
       speed_act_right = ((pos_right/1441)*2*PI)*(1000/LOOPTIME)*radius;
+      position_right = ((pos_right/1441)*2 * PI)*radius;
     }
     
     encoder_left = encoder_left + pos_left;
@@ -198,6 +224,22 @@ void loop() {
 
 //Publish function for odometry, uses a vector type message to send the data (message type is not meant for that but that's easier than creating a specific message type)
 void publishSpeed() {
+//  t.header.frame_id = odom;
+//  t.child_frame_id = base_footprint;
+//  
+//  t.transform.translation.x = x;
+//  t.transform.translation.y = y;
+//  
+//  t.transform.rotation = tf::createQuaternionFromYaw(theta);
+//  t.header.stamp = nh.now();
+  
+  broadcaster.sendTransform(t);
+  joint_state_msg.position[0] = position_left;
+  joint_state_msg.position[1] = position_right;
+  joint_state_msg.velocity[0] = speed_act_left;
+  joint_state_msg.velocity[1] = speed_act_right;
+  joint_state_pub.publish(&joint_state_msg);
+  
   speed_msg.header.stamp = nh.now();      //timestamp for odometry data
   speed_msg.vector.x = speed_act_left;    //left wheel speed (in m/s)
   speed_msg.vector.y = speed_act_right;   //right wheel speed (in m/s)
@@ -213,15 +255,14 @@ void publishSpeed() {
   pwm_output_pub.publish(&pwm_output_msg);
  
   nh.spinOnce();
-  nh.loginfo("Publishing odometry");
 }
 //Đếm xung encoder động cơ trái
 void encoderLeftMotor() {
-  if (digitalRead(PIN_L_ENCOD_A_MOTOR) == digitalRead(PIN_L_ENCOD_B_MOTOR)) pos_left++;
-  else pos_left--;
+  if (digitalRead(PIN_L_ENCOD_A_MOTOR) == digitalRead(PIN_L_ENCOD_B_MOTOR)) pos_left--;
+  else pos_left++;
 }
 //Đếm xung encoder động cơ phải
 void encoderRightMotor() {
-  if (digitalRead(PIN_R_ENCOD_A_MOTOR) == digitalRead(PIN_R_ENCOD_B_MOTOR)) pos_right--;
-  else pos_right++;
+  if (digitalRead(PIN_R_ENCOD_A_MOTOR) == digitalRead(PIN_R_ENCOD_B_MOTOR)) pos_right++;
+  else pos_right--;
 }
